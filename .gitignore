@@ -1,5 +1,6 @@
 # ข้อมูลความลับและคีย์ (ห้ามอัปโหลดขึ้น GitHub เด็ดขาด)
 .env
+render_env.txt
 credentials.json
 *.pem
 *.key

@@ -172,6 +172,19 @@ class DatabaseManager:
                 self.save_patient_name(user_id, rec["patient_name"])
                 return rec["patient_name"]
 
+        # ค้นหาสำรองจาก Google Sheets (กรณีรันบน Cloud เช่น Render แล้ว Container รีสตาร์ท)
+        worksheet = self._get_google_worksheet()
+        if worksheet is not None:
+            try:
+                all_rows = worksheet.get_all_values()
+                for r in reversed(all_rows[1:]):
+                    if len(r) >= 4 and r[1] == user_id and r[3].strip():
+                        found_name = r[3].strip()
+                        self.save_patient_name(user_id, found_name, r[2] if len(r) > 2 else "")
+                        return found_name
+            except Exception as exc:
+                logger.warning(f"ค้นหาชื่อผู้ป่วยจาก Google Sheets ไม่สำเร็จ: {exc}")
+
         return None
 
     # =========================================================
