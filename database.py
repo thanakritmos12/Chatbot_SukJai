@@ -11,8 +11,16 @@ import os
 import sqlite3
 import threading
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+
+# โซนเวลาประเทศไทย (UTC+7) เพื่อให้เวลาตรงกับไทยเสมอแม้รันบน Cloud Server (Render)
+THAILAND_TZ = timezone(timedelta(hours=7))
+
+
+def _now_th_str() -> str:
+    """คืนค่าวันและเวลาปัจจุบันตามเวลาประเทศไทย (UTC+7)"""
+    return datetime.now(THAILAND_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 try:
     import gspread
@@ -135,7 +143,7 @@ class DatabaseManager:
         self, user_id: str, patient_name: str, display_name: str = ""
     ) -> None:
         """บันทึกหรืออัปเดตชื่อ-นามสกุลของผู้ป่วยผูกกับ LINE User ID"""
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _now_th_str()
         with closing(self._get_conn()) as conn:
             conn.execute(
                 """
@@ -202,7 +210,7 @@ class DatabaseManager:
         patient_name: str = "",
         initial_step: int = 0,
     ) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _now_th_str()
         with closing(self._get_conn()) as conn:
             conn.execute(
                 """
@@ -238,7 +246,7 @@ class DatabaseManager:
     def update_session(
         self, user_id: str, next_step: int, answers: Dict[str, Any]
     ) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _now_th_str()
         with closing(self._get_conn()) as conn:
             conn.execute(
                 """
@@ -330,7 +338,7 @@ class DatabaseManager:
         evaluation: Dict[str, Any],
     ) -> Dict[str, Any]:
         """บันทึกผลการคัดกรองภาวะโรคหลอดเลือดสมองลงทั้ง Google Sheets และ SQLite"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = _now_th_str()
         clean_patient_name = (patient_name or display_name).strip()
 
         # จดจำชื่อ-นามสกุลผู้ป่วยไว้สำหรับครั้งถัดไปเสมอ
