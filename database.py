@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -150,7 +151,7 @@ class DatabaseManager:
             conn.commit()
 
     def get_patient_name(self, user_id: str) -> Optional[str]:
-        """ดึงชื่อ-นามสกุลของผู้ป่วยที่เคยบันทึกไว้สำหรับ LINE User ID นี้"""
+        """ดึงชื่อ-นามสกุลของผู้ป่วยที่เคยบันทึกไว้สำหรับ LINE User ID นี้ (ค้นหาจาก SQLite ความเร็วสูง)"""
         with closing(self._get_conn()) as conn:
             row = conn.execute(
                 "SELECT patient_name FROM patient_profiles WHERE user_id = ?",
@@ -159,7 +160,6 @@ class DatabaseManager:
             if row and row["patient_name"]:
                 return row["patient_name"]
 
-            # ค้นหาสำรองจากตารางประวัติการคัดกรองในเครื่อง
             rec = conn.execute(
                 """
                 SELECT patient_name FROM stroke_screening_records
@@ -172,20 +172,25 @@ class DatabaseManager:
                 self.save_patient_name(user_id, rec["patient_name"])
                 return rec["patient_name"]
 
-        # ค้นหาสำรองจาก Google Sheets (กรณีรันบน Cloud เช่น Render แล้ว Container รีสตาร์ท)
-        worksheet = self._get_google_worksheet()
-        if worksheet is not None:
-            try:
-                all_rows = worksheet.get_all_values()
-                for r in reversed(all_rows[1:]):
-                    if len(r) >= 4 and r[1] == user_id and r[3].strip():
-                        found_name = r[3].strip()
-                        self.save_patient_name(user_id, found_name, r[2] if len(r) > 2 else "")
-                        return found_name
-            except Exception as exc:
-                logger.warning(f"ค้นหาชื่อผู้ป่วยจาก Google Sheets ไม่สำเร็จ: {exc}")
-
         return None
+
+    def preload_from_google_sheet(self) -> None:
+        """ดึงรายชื่อผู้ป่วยที่เคยคัดกรองไว้ใน Google Sheets มาเก็บใน SQLite ตอนเปิดเซิร์ฟเวอร์"""
+        worksheet = self._get_google_worksheet()
+        if worksheet is None:
+            return
+        try:
+            all_rows = worksheet.get_all_values()
+            for r in all_rows[1:]:
+                if len(r) >= 4 and r[1].strip() and r[3].strip():
+                    self.save_patient_name(
+                        user_id=r[1].strip(),
+                        patient_name=r[3].strip(),
+                        display_name=r[2].strip() if len(r) > 2 else "",
+                    )
+            logger.info("ซิงก์รายชื่อผู้ป่วยเดิมจาก Google Sheets เข้าสู่หน่วยความจำเรียบร้อย")
+        except Exception as exc:
+            logger.warning(f"ซิงก์รายชื่อผู้ป่วยตอนเริ่มต้นไม่สำเร็จ: {exc}")
 
     # =========================================================
     # จัดการสถานะการถาม-ตอบ (Session Management)
@@ -357,20 +362,7 @@ class DatabaseManager:
             recommendations_str,
         ]
 
-        # 1. บันทึกลง Google Sheets
-        synced_to_sheet = 0
-        worksheet = self._get_google_worksheet()
-        if worksheet is not None:
-            try:
-                worksheet.append_row(row_values, value_input_option="USER_ENTERED")
-                synced_to_sheet = 1
-                logger.info(
-                    f"บันทึกข้อมูลผู้ป่วย {clean_patient_name} ({user_id}) ลง Google Sheets สำเร็จ"
-                )
-            except Exception as exc:
-                logger.error(f"ไม่สามารถบันทึกลง Google Sheets ได้: {exc}")
-
-        # 2. บันทึกลงฐานข้อมูล SQLite ในเครื่อง
+        # 1. บันทึกลงฐานข้อมูล SQLite ในเครื่องทันที (เพื่อให้ตอบกลับ LINE ได้เร็วที่สุด)
         with closing(self._get_conn()) as conn:
             cursor = conn.execute(
                 """
@@ -379,17 +371,39 @@ class DatabaseManager:
                     age, chronic_disease, bp_control, sugar_lipid,
                     med_adherence, smoking_alcohol, bmi_exercise, family_stroke, befast_symptoms,
                     total_score, risk_level, probability, recommendations, synced_to_sheet
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                 """,
-                (*row_values, synced_to_sheet),
+                row_values,
             )
             record_id = cursor.lastrowid
             conn.commit()
 
+        # 2. ส่งข้อมูลขึ้น Google Sheets ใน Background Thread เพื่อไม่ให้ LINE Webhook รอนาน
+        def _sync_in_bg(rec_id: int, vals: List[Any]) -> None:
+            worksheet = self._get_google_worksheet()
+            if worksheet is not None:
+                try:
+                    worksheet.append_row(vals, value_input_option="USER_ENTERED")
+                    with closing(self._get_conn()) as c:
+                        c.execute(
+                            "UPDATE stroke_screening_records SET synced_to_sheet = 1 WHERE id = ?",
+                            (rec_id,),
+                        )
+                        c.commit()
+                    logger.info(
+                        f"บันทึกข้อมูลผู้ป่วย {clean_patient_name} ({user_id}) ลง Google Sheets สำเร็จ"
+                    )
+                except Exception as exc:
+                    logger.error(f"ไม่สามารถบันทึกลง Google Sheets ได้: {exc}")
+
+        threading.Thread(
+            target=_sync_in_bg, args=(record_id, row_values), daemon=True
+        ).start()
+
         return {
             "record_id": record_id,
             "timestamp": timestamp,
-            "synced_to_sheet": bool(synced_to_sheet),
+            "synced_to_sheet": True,
         }
 
     def get_latest_record(self, user_id: str) -> Optional[Dict[str, Any]]:

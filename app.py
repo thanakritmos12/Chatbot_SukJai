@@ -6,8 +6,12 @@
 3. GET  /api/records - ดึงข้อมูลที่บันทึกไว้ในระบบ
 """
 
+import asyncio
 import logging
 import os
+import threading
+import urllib.request
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
@@ -24,6 +28,7 @@ from linebot.v3.messaging import (
     FlexMessage,
     MessageAction,
     MessagingApi,
+    PushMessageRequest,
     QuickReply,
     QuickReplyItem,
     ReplyMessageRequest,
@@ -43,13 +48,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stroke-screening-bot")
 
+db = DatabaseManager()
+
+
+async def _keep_alive_loop():
+    """ส่งสัญญาณกระตุ้นเซิร์ฟเวอร์ตัวเองทุก 10 นาที เพื่อป้องกันไม่ให้ Render Free Tier หลับ"""
+    target_url = os.getenv(
+        "RENDER_EXTERNAL_URL", "https://chatbot-sukjai.onrender.com"
+    ).rstrip("/") + "/health"
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await asyncio.to_thread(
+                lambda: urllib.request.urlopen(target_url, timeout=15).read()
+            )
+            logger.info(f"Keep-alive ping successful: {target_url}")
+        except Exception as exc:
+            logger.debug(f"Keep-alive ping skipped: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # โหลดรายชื่อผู้ป่วยเดิมจาก Google Sheets เข้าหน่วยความจำตอนเริ่มต้น
+    threading.Thread(target=db.preload_from_google_sheet, daemon=True).start()
+    keep_alive_task = asyncio.create_task(_keep_alive_loop())
+    yield
+    keep_alive_task.cancel()
+
+
 app = FastAPI(
     title="LINE Chatbot คัดกรองความเสี่ยงภาวะโรคหลอดเลือดสมองในผู้ป่วยโรคเรื้อรัง",
     description="ระบบคัดกรองความเสี่ยงภาวะโรคหลอดเลือดสมองในผู้ป่วยโรคเรื้อรังผ่าน LINE พร้อมจดจำชื่อผู้ป่วยและบันทึกข้อมูลลง Google Sheets",
-    version="2.0.0",
+    version="2.1.0",
+    lifespan=lifespan,
 )
-
-db = DatabaseManager()
 
 # ตั้งค่า LINE Messaging API
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -116,18 +148,27 @@ def handle_follow_event(event: FollowEvent):
             qr_items.insert(1, {"label": "✏️ เปลี่ยนชื่อผู้ป่วย", "text": "เปลี่ยนชื่อ"})
 
         quick_reply = _to_line_quick_reply(qr_items)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[
-                    FlexMessage(
-                        alt_text="ยินดีต้อนรับสู่ระบบคัดกรองความเสี่ยงภาวะโรคหลอดเลือดสมองในผู้ป่วยโรคเรื้อรัง",
-                        contents=FlexContainer.from_dict(welcome_flex),
-                        quick_reply=quick_reply,
-                    )
-                ],
+        messages = [
+            FlexMessage(
+                alt_text="ยินดีต้อนรับสู่ระบบคัดกรองความเสี่ยงภาวะโรคหลอดเลือดสมองในผู้ป่วยโรคเรื้อรัง",
+                contents=FlexContainer.from_dict(welcome_flex),
+                quick_reply=quick_reply,
             )
-        )
+        ]
+        try:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=messages,
+                )
+            )
+        except Exception:
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=messages,
+                )
+            )
 
 
 @webhook_handler.add(MessageEvent, message=TextMessageContent)
@@ -140,12 +181,16 @@ def handle_text_message(event: MessageEvent):
     with ApiClient(line_configuration) as api_client:
         line_bot_api = MessagingApi(api_client)
 
-        try:
-            profile = line_bot_api.get_profile(user_id)
-            if profile and profile.display_name:
-                display_name = profile.display_name
-        except Exception:
-            pass
+        existing_session = db.get_session(user_id)
+        if existing_session and existing_session.get("display_name"):
+            display_name = existing_session["display_name"]
+        else:
+            try:
+                profile = line_bot_api.get_profile(user_id)
+                if profile and profile.display_name:
+                    display_name = profile.display_name
+            except Exception:
+                pass
 
         result = process_user_message(
             user_id=user_id,
@@ -177,12 +222,21 @@ def handle_text_message(event: MessageEvent):
                 )
             )
 
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=messages,
+        try:
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=messages,
+                )
             )
-        )
+        except Exception as exc:
+            logger.warning(f"reply_message ล้มเหลว (อาจเกิดจาก Cold Start): {exc} -> ส่งด้วย push_message แทน")
+            line_bot_api.push_message(
+                PushMessageRequest(
+                    to=user_id,
+                    messages=messages,
+                )
+            )
 
 
 # =====================================================================
